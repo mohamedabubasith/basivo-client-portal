@@ -1,0 +1,236 @@
+name: Autonomous M1 - GitHub runner
+run-name: AIP-6 autonomous plan, code, test and review
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: client-portal-AIP-6
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+jobs:
+  agent:
+    if: github.actor == 'mohamedabubasith' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    services:
+      postgres:
+        image: postgres:17.7
+        env:
+          POSTGRES_USER: portal
+          POSTGRES_PASSWORD: portal
+          POSTGRES_DB: portal_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      DATABASE_URL: postgres://portal:portal@localhost:5432/portal_test
+      NEXT_TELEMETRY_DISABLED: '1'
+      FACTORY_BASE_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {persist-credentials: false}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '24'}
+      - name: Validate approval and prepare native Codex
+        run: |
+          node .factory/runner.mjs preflight
+          npm install -g @openai/codex@0.156.1
+      - name: Seed temporary access-only Codex login
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          node --input-type=module -e '
+            import {mkdirSync,writeFileSync} from "node:fs";
+            const auth=JSON.parse(process.env.CODEX_AUTH_JSON || "null");
+            if(!auth?.tokens?.access_token || auth.tokens.refresh_token) throw new Error("Access-only Codex authentication is required");
+            const dir=process.env.RUNNER_TEMP+"/factory-codex";
+            mkdirSync(dir,{recursive:true,mode:0o700});
+            writeFileSync(dir+"/auth.json",JSON.stringify(auth),{mode:0o600});'
+      - name: Planning agent
+        timeout-minutes: 10
+        env:
+          CODEX_HOME: ${{ runner.temp }}/factory-codex
+        run: |
+          node .factory/runner.mjs prompt plan
+          node .factory/codex.mjs plan
+          test -s "$RUNNER_TEMP/factory-output/plan.md"
+      - name: Publish runner plan for review visibility
+        env:
+          YOUTRACK_TOKEN: ${{ secrets.YOUTRACK_TOKEN }}
+        run: |
+          cat "$RUNNER_TEMP/factory-output/plan.md" >> "$GITHUB_STEP_SUMMARY"
+          node .factory/youtrack.mjs plan
+      - name: Implementation agent
+        timeout-minutes: 45
+        env:
+          CODEX_HOME: ${{ runner.temp }}/factory-codex
+        run: |
+          node .factory/runner.mjs prompt build
+          node .factory/codex.mjs build
+      - name: Package candidate with protected-policy checks
+        run: node .factory/runner.mjs package
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: candidate
+          path: ${{ runner.temp }}/factory-output/
+          retention-days: 7
+          if-no-files-found: error
+      - name: Remove temporary login
+        if: always()
+        run: node -e 'require("node:fs").rmSync(process.env.RUNNER_TEMP+"/factory-codex",{recursive:true,force:true})'
+  publish:
+    needs: agent
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      sha: ${{ steps.publish.outputs.sha }}
+      branch: ${{ steps.publish.outputs.branch }}
+      pr: ${{ steps.publish.outputs.pr }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {fetch-depth: 0, persist-credentials: false}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with: {name: candidate, path: '${{ runner.temp }}/factory-output'}
+      - name: Validate artifact and create candidate commit and PR
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          node .factory/runner.mjs validate
+          BRANCH="factory/AIP-6-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          git checkout -b "$BRANCH"
+          git config user.name 'Basivo GitHub Agent'
+          git config user.email 'mohamedabu.basith@gmail.com'
+          git add --all
+          git -c core.hooksPath=/dev/null commit -m 'AIP-6: implement foundation on GitHub runner'
+          SHA="$(git rev-parse HEAD)"
+          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push origin "$BRANCH"
+          BODY="$RUNNER_TEMP/pr-body.md"
+          { echo 'Implements https://basivo.youtrack.cloud/issue/AIP-6 under the approved AIP-5 plan.'; echo; echo "Runner evidence: https://github.com/$REPO/actions/runs/$GITHUB_RUN_ID"; echo; cat "$RUNNER_TEMP/factory-output/implementation.md"; } > "$BODY"
+          PR="$(gh pr create --repo "$REPO" --base main --head "$BRANCH" --title 'AIP-6: Foundation built by GitHub runner' --body-file "$BODY")"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+  independent-tests:
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17.7
+        env: {POSTGRES_USER: portal, POSTGRES_PASSWORD: portal, POSTGRES_DB: portal_test}
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      DATABASE_URL: postgres://portal:portal@localhost:5432/portal_test
+      NODE_ENV: test
+      NEXT_TELEMETRY_DISABLED: '1'
+      PORT: '3000'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ needs.publish.outputs.sha }}', persist-credentials: false}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '24'}
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - name: Migrate fresh database and verify replay safety
+        run: |
+          npm run db:migrate
+          npm run db:migrate
+      - run: npm run test:integration
+      - run: npm run build
+        env: {NODE_ENV: production}
+      - name: Production HTTP health
+        env: {NODE_ENV: production}
+        run: |
+          set -euo pipefail
+          npm start > "$RUNNER_TEMP/web.log" 2>&1 &
+          WEB_PID=$!
+          trap 'kill "$WEB_PID" 2>/dev/null || true' EXIT
+          curl --retry 30 --retry-connrefused --retry-delay 2 --fail --silent --show-error http://localhost:3000/api/health
+      - name: Validate Compose and build deployable image
+        run: |
+          set -euo pipefail
+          cp .env.example .env
+          docker compose config --quiet
+          docker build --tag basivo-client-portal:verification .
+  independent-review:
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {ref: '${{ needs.publish.outputs.sha }}', fetch-depth: 0, persist-credentials: false}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with: {node-version: '24'}
+      - run: npm install -g @openai/codex@0.156.1
+      - name: Seed temporary review login
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+        run: |
+          node --input-type=module -e '
+            import {mkdirSync,writeFileSync} from "node:fs";
+            const auth=JSON.parse(process.env.CODEX_AUTH_JSON || "null");
+            if(!auth?.tokens?.access_token || auth.tokens.refresh_token) throw new Error("Access-only authentication required");
+            const dir=process.env.RUNNER_TEMP+"/factory-codex";
+            mkdirSync(dir,{recursive:true,mode:0o700});
+            writeFileSync(dir+"/auth.json",JSON.stringify(auth),{mode:0o600});'
+      - name: Independent structured review of precise commit
+        env:
+          CODEX_HOME: ${{ runner.temp }}/factory-codex
+          FACTORY_BASE_SHA: ${{ github.sha }}
+        run: |
+          node .factory/runner.mjs prompt review
+          node .factory/codex.mjs review
+          node .factory/runner.mjs review-gate
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with: {name: independent-review, path: '${{ runner.temp }}/review.json', retention-days: 7}
+      - name: Remove temporary login
+        if: always()
+        run: node -e 'require("node:fs").rmSync(process.env.RUNNER_TEMP+"/factory-codex",{recursive:true,force:true})'
+  merge:
+    needs: [publish, independent-tests, independent-review]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: {persist-credentials: false}
+      - name: Enforce exact head, unchanged base, review and verified status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CANDIDATE_SHA: ${{ needs.publish.outputs.sha }}
+          PR_URL: ${{ needs.publish.outputs.pr }}
+          BASE_SHA: ${{ github.sha }}
+          YOUTRACK_TOKEN: ${{ secrets.YOUTRACK_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$(gh pr view "$PR_URL" --repo "$REPO" --json headRefOid --jq .headRefOid)" = "$CANDIDATE_SHA"
+          test "$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)" = "$BASE_SHA"
+          node .factory/youtrack.mjs check
+          gh api --method POST "repos/$REPO/statuses/$CANDIDATE_SHA" -f state=success -f context='factory/verified-candidate' -f description='Independent tests and structured review passed for this SHA' -f target_url="https://github.com/$REPO/actions/runs/$GITHUB_RUN_ID"
+          gh pr merge "$PR_URL" --repo "$REPO" --squash --match-head-commit "$CANDIDATE_SHA"
+          test "$(gh pr view "$PR_URL" --repo "$REPO" --json state --jq .state)" = MERGED
+          echo "Merged tested and reviewed candidate: $PR_URL" >> "$GITHUB_STEP_SUMMARY"
+      - name: Report verified merge to YouTrack when configured
+        env:
+          YOUTRACK_TOKEN: ${{ secrets.YOUTRACK_TOKEN }}
+          PR_URL: ${{ needs.publish.outputs.pr }}
+        run: node .factory/youtrack.mjs merged

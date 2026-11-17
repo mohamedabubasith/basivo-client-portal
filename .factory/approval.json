@@ -1,0 +1,12 @@
+{
+  "epic": "AIP-5",
+  "ticket": "AIP-6",
+  "planSha256": "2fd917ee7b4eaba79428292333b67c9a7a92faa311403900c9cd51099dd274e1",
+  "approvedBy": "admin",
+  "approvalText": "Approved—start building",
+  "approvalCreatedAt": 1794945915809,
+  "approvalUrl": "https://basivo.youtrack.cloud/issue/AIP-5#focus=Comments-7-3.0-0",
+  "sourceVerifiedAt": "2026-11-18",
+  "scope": "M1 Foundation and deployable app shell only",
+  "dispatchActor": "mohamedabubasith"
+}
